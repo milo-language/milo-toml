@@ -1,0 +1,41 @@
+// Reads a config the way a service would: typed lookups with defaults, a nested
+// table, and an array of tables walked in order.
+from "../lib" import {
+    Toml
+}
+from "std/fs" import {
+    readFile
+}
+from "std/args" import {
+    args
+}
+
+pub fn main(): i32 {
+    let argv = args()
+    if argv.len() < 2 {
+        print("usage: config <file.toml>")
+        return 1
+    }
+    let text = readFile(argv[1])!
+    let cfg = Toml.parse(text)!
+
+    print("service: " + (cfg.str("name") ?? "unnamed") + " v" + (cfg.str("version") ?? "0"))
+    print("listen:  " + (cfg.strPath("server.host") ?? "127.0.0.1") + ":" + (cfg.i64Path("server.port") ?? 8080).toString())
+    print("pool:    " + (cfg.i64Path("database.pool.min") ?? 1).toString() + "-" + (cfg.i64Path("database.pool.max") ?? 8).toString())
+
+    let routes = cfg.get("route")!
+    print("routes:  " + routes.len().toString())
+    for i in 0..routes.len() {
+        let r = routes.at(i)!
+        let methods = r.get("methods")!
+        var line: string = "  " + (r.str("path") ?? "?") + " ["
+        for m in 0..methods.len() {
+            if m > 0 {
+                line = line + ", "
+            }
+            line = line + (methods.at(m)!.asStr() ?? "")
+        }
+        print(line + "]")
+    }
+    return 0
+}

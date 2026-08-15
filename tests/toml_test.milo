@@ -1,0 +1,117 @@
+// API-contract tests. Deep conformance is scripts/oracle.py's job — it grades a
+// 78-file corpus against Python tomllib on values AND types. What this file pins
+// is the surface: that each accessor answers what the README says it answers,
+// and that malformed input is rejected with a locatable message.
+from "../lib" import {
+    Toml,
+    TomlKind
+}
+from "std/testing" import {
+    assertStrEqual, assertEqual64, assertTrue, assertFalse, assertContains
+}
+
+let SAMPLE: string = "title = \"demo\"\nport = 8080\nratio = 1.5\ndebug = true\ntags = [\"a\", \"b\", \"c\"]\nstamp = 2026-08-14T09:15:00Z\n\n[server]\nhost = \"localhost\"\nkeys = { pub = \"x\", sec = \"y\" }\n\n[[bin]]\nname = \"one\"\n\n[[bin]]\nname = \"two\"\n"
+
+fn doc(): Toml {
+    return Toml.parse(SAMPLE.clone())!
+}
+
+fn testScalarAccessors() {
+    let t = doc()
+    assertStrEqual(t.str("title") ?? "", "demo")
+    assertEqual64(t.i64("port") ?? 0, 8080)
+    assertTrue((t.f64("ratio") ?? 0.0) == 1.5)
+    assertTrue(t.bool("debug") ?? false)
+    // A key that is absent and a key whose value is of another type both answer
+    // None — the accessor is typed, so `str` on an integer is a miss, not a cast.
+    assertTrue(t.str("port").isNone())
+    assertTrue(t.i64("nope").isNone())
+}
+
+fn testArrays() {
+    let t = doc()
+    let tags = t.get("tags")!
+    assertTrue(tags.isArray())
+    assertEqual64(tags.len(), 3)
+    assertStrEqual(tags.at(0)!.asStr() ?? "", "a")
+    assertStrEqual(tags.at(2)!.asStr() ?? "", "c")
+    // Out of range is None rather than a trap: indexing a document you did not
+    // write is a lookup, not a programming error.
+    assertTrue(tags.at(9).isNone())
+}
+
+fn testTablesAndPaths() {
+    let t = doc()
+    let server = t.table("server")!
+    assertStrEqual(server.str("host") ?? "", "localhost")
+    assertStrEqual(t.strPath("server.host") ?? "", "localhost")
+    assertStrEqual(t.strPath("server.keys.pub") ?? "", "x")
+    assertTrue(t.path("server.missing").isNone())
+}
+
+fn testArrayOfTables() {
+    let t = doc()
+    let bins = t.get("bin")!
+    assertEqual64(bins.len(), 2)
+    assertStrEqual(bins.at(0)!.str("name") ?? "", "one")
+    assertStrEqual(bins.at(1)!.str("name") ?? "", "two")
+}
+
+fn testKinds() {
+    let t = doc()
+    assertTrue(t.get("title")!.isStr())
+    assertTrue(t.get("port")!.isInt())
+    assertTrue(t.get("ratio")!.isFloat())
+    assertTrue(t.get("port")!.isNum())
+    assertTrue(t.get("stamp")!.isDateTime())
+    assertTrue(t.get("server")!.isTable())
+    assertFalse(t.get("title")!.isArray())
+    // Datetimes keep their lexical text — this library builds no temporal values.
+    assertStrEqual(t.get("stamp")!.asStr() ?? "", "2026-08-14T09:15:00Z")
+}
+
+fn testKeys() {
+    let t = doc()
+    let ks = t.table("server")!.keys()
+    assertEqual64(ks.len(), 2)
+    assertStrEqual(ks[0], "host")
+}
+
+fn testRoundTrip() {
+    let t = doc()
+    let again = Toml.parse(t.stringify())!
+    assertStrEqual(again.str("title") ?? "", "demo")
+    assertEqual64(again.i64("port") ?? 0, 8080)
+    assertStrEqual(again.strPath("server.keys.sec") ?? "", "y")
+    assertEqual64(again.get("bin")!.len(), 2)
+    assertEqual64(again.get("tags")!.len(), 3)
+}
+
+fn testRejections() {
+    // Each message must locate the fault; a parser that only says "invalid" makes
+    // the user bisect their own config.
+    match Toml.parse("a = 1\na = 2\n") {
+        Result.Ok(_t) => {
+            assertTrue(false)
+        }
+        Result.Err(e) => {
+            assertContains(e, "line 2")
+        }
+    }
+    match Toml.parse("[x]\n[x]\n") {
+        Result.Ok(_t) => {
+            assertTrue(false)
+        }
+        Result.Err(e) => {
+            assertContains(e, "twice")
+        }
+    }
+    match Toml.parse("s = \"unterminated\n") {
+        Result.Ok(_t) => {
+            assertTrue(false)
+        }
+        Result.Err(e) => {
+            assertContains(e, "line 1")
+        }
+    }
+}

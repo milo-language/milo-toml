@@ -1,0 +1,10 @@
+{
+  "name": "toml",
+  "version": "0.1.0",
+  "description": "TOML v1.0.0 parser and serializer, graded against Python tomllib",
+  "license": "MIT",
+  "repository": "github.com/milo-language/milo-toml",
+  "lib": "lib.milo",
+  "targets": ["darwin", "linux", "windows"],
+  "exclude": ["tests/**", "examples/**", "scripts/**"]
+}
