@@ -24,12 +24,13 @@ Copy this into `main.milo` and run `milo run main.milo`:
 from "toml" import { Toml }
 
 pub fn main(): i32 {
+    // TOML's single-quoted literal strings keep the Milo string free of escapes.
     let doc = Toml.parse("
-name = \"checkout-api\"
+name = 'checkout-api'
 debug = false
 
 [server]
-host = \"0.0.0.0\"
+host = '0.0.0.0'
 port = 8080
 ")!
 
@@ -139,12 +140,28 @@ match Toml.parse(text) {
 
 ## Writing TOML
 
-`stringify` renders a document back to text that re-parses to an equal document:
+`stringify` renders a document back to text that re-parses to an equal document.
+Round-trip it and the second rendering is byte-identical to the first:
 
 ```milo
-let doc = Toml.parse(readFile("app.toml")!)!
-print(doc.stringify())
+from "toml" import { Toml }
+from "std/fs" import { readFile }
+
+pub fn main(): i32 {
+    let doc = Toml.parse(readFile("app.toml")!)!
+
+    let text = doc.stringify()
+    let again = Toml.parse(text.clone())!
+
+    print((text == again.stringify()).toString())   // true
+    print((again.i64Path("server.port") ?? 0).toString())
+    return 0
+}
 ```
+
+Formatting is not preserved. Comments are dropped, `30_000` comes back as `30000`,
+`'literal'` strings come back double-quoted, and an inline table that owns only tables
+comes back as a `[section]`. Key order, values, types and structure are preserved.
 
 ## Runnable examples
 
