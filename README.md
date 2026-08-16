@@ -4,24 +4,17 @@ This is a package for the [Milo language](https://milo-language.github.io/milo/)
 
 ## Overview
 
-A [TOML v1.0.0](https://toml.io/en/v1.0.0) parser and serializer, with no
-dependencies beyond the standard library.
+Read TOML config files, and write them back out.
 
-Every accessor returns an `Option`, so `??` supplies a default in one line and
-there is no missing-key branch to write. `Toml.parse` returns a `Result` whose
-error carries a message plus the line and column.
+```milo
+let port = cfg.i64Path("server.port") ?? 8080
+```
 
-It is strict rather than last-wins: duplicate keys, duplicate table headers, and
-redefining a table as a non-table are all errors, not silently accepted.
-Datetimes are recognised, range-checked and tagged `TomlKind.DateTime`, but kept
-as their original text and read back with `asStr` — this library builds no
-temporal values, because a lossy conversion would be worse than the text.
+A missing key comes back as `None`, so `??` supplies the default in the same
+line.
 
-Every TOML v1.0.0 construct is implemented, and the whole thing is graded
-against Python's `tomllib` over a 78-file corpus on both a direct parse and a
-`parse → stringify → parse` round trip.
-
-Every function and method: [docs/api.md](docs/api.md).
+All of TOML v1.0.0, strictly: duplicate keys and duplicate table headers are
+errors here, not last-wins. Full API: [docs/api.md](docs/api.md).
 
 ## Installation
 
