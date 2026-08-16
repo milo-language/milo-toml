@@ -1,56 +1,52 @@
 # toml
 
-A [TOML v1.0.0](https://toml.io/en/v1.0.0) parser and serializer for
-[Milo](https://github.com/milo-language/milo). No dependencies beyond the
-standard library.
+This is a package for the [Milo language](https://milo-language.github.io/milo/).
 
-## Install
+## Overview
+
+A [TOML v1.0.0](https://toml.io/en/v1.0.0) parser and serializer, with no
+dependencies beyond the standard library.
+
+Every accessor returns an `Option`, so `??` supplies a default in one line and
+there is no missing-key branch to write. `Toml.parse` returns a `Result` whose
+error carries a message plus the line and column.
+
+It is strict rather than last-wins: duplicate keys, duplicate table headers, and
+redefining a table as a non-table are all errors, not silently accepted.
+Datetimes are recognised, range-checked and tagged `TomlKind.DateTime`, but kept
+as their original text and read back with `asStr` — this library builds no
+temporal values, because a lossy conversion would be worse than the text.
+
+Every TOML v1.0.0 construct is implemented, and the whole thing is graded
+against Python's `tomllib` over a 78-file corpus on both a direct parse and a
+`parse → stringify → parse` round trip.
+
+Every function and method: [docs/api.md](docs/api.md).
+
+## Installation
 
 ```bash
 milo add github.com/milo-language/milo-toml
 ```
 
-Then import it:
-
 ```milo
 from "toml" import { Toml }
 ```
 
-## Quick start
+## Examples
 
-Copy this into `main.milo` and run `milo run main.milo`:
+### Reading a config file
 
-```milo
-from "toml" import { Toml }
+Given `app.toml`:
 
-pub fn main(): i32 {
-    // TOML's single-quoted literal strings keep the Milo string free of escapes.
-    let doc = Toml.parse("
+```toml
 name = 'checkout-api'
 debug = false
 
 [server]
 host = '0.0.0.0'
 port = 8080
-")!
-
-    print(doc.str("name") ?? "unnamed")
-    print(doc.strPath("server.host") ?? "127.0.0.1")
-    print((doc.i64Path("server.port") ?? 80).toString())
-    return 0
-}
 ```
-
-```
-checkout-api
-0.0.0.0
-8080
-```
-
-## Reading a config file
-
-Every accessor returns an `Option`, so `??` gives you a default in one line —
-no missing-key branch to write.
 
 ```milo
 from "toml" import { Toml }
@@ -62,48 +58,49 @@ pub fn main(): i32 {
     let name = cfg.str("name") ?? "unnamed"          // top-level string
     let debug = cfg.bool("debug") ?? false           // top-level bool
     let port = cfg.i64Path("server.port") ?? 8080    // dotted path into [server]
-    let ratio = cfg.f64Path("limits.ratio") ?? 1.0   // dotted path, float
+    let ratio = cfg.f64Path("limits.ratio") ?? 1.0   // absent, so the default answers
 
-    print(name + " debug=" + debug.toString() + " port=" + port.toString())
+    print($"{name} debug={debug} port={port} ratio={ratio}")
+
+    // A sub-table can be pulled out and reused as its own handle.
+    let server = cfg.table("server")!
+    print($"{server.str("host") ?? "127.0.0.1"}:{server.i64("port") ?? 80}")
     return 0
 }
 ```
 
-Sub-tables can also be pulled out and reused as their own handle:
-
-```milo
-let server = cfg.table("server")!
-print((server.str("host") ?? "127.0.0.1") + ":" + (server.i64("port") ?? 80).toString())
+```
+checkout-api debug=false port=8080 ratio=1
+0.0.0.0:8080
 ```
 
-## Arrays
+### Arrays and arrays of tables
+
+`[[route]]` blocks come back as an array, in document order. Arrays and tables
+are both handles, so the same `len`/`at` walk reaches either:
 
 ```milo
-// tags = ["web", "api", "beta"]
+let cfg = Toml.parse("
+tags = ['web', 'api']
+
+[[route]]
+path = '/health'
+methods = ['GET']
+
+[[route]]
+path = '/orders'
+methods = ['GET', 'POST']
+")!
+
 let tags = cfg.get("tags")!
 for i in 0..tags.len() {
     print(tags.at(i)!.asStr() ?? "")
 }
-```
-
-## Arrays of tables
-
-`[[route]]` blocks come back as an array, in document order:
-
-```milo
-// [[route]]
-// path = "/health"
-// methods = ["GET"]
-//
-// [[route]]
-// path = "/orders"
-// methods = ["GET", "POST"]
 
 let routes = cfg.get("route")!
 for i in 0..routes.len() {
     let r = routes.at(i)!
     print(r.str("path") ?? "?")
-
     let methods = r.get("methods")!
     for m in 0..methods.len() {
         print("  " + (methods.at(m)!.asStr() ?? ""))
@@ -111,124 +108,46 @@ for i in 0..routes.len() {
 }
 ```
 
-## Walking unknown keys
+```
+web
+api
+/health
+  GET
+/orders
+  GET
+  POST
+```
+
+### Writing TOML
+
+`stringify` renders a document back to text that re-parses to an equal document,
+and rendering that again is byte-identical:
 
 ```milo
-let env = cfg.table("env")!
-for k in env.keys() {
-    print(k + " = " + (env.str(k) ?? ""))
-}
+let doc = Toml.parse("
+[server]
+port = 30_000
+host = 'localhost'
+")!
+
+let text = doc.stringify()
+let again = Toml.parse(text.clone())!
+
+print(text)
+print($"round-trips: {text == again.stringify()}")
 ```
 
-## Handling parse errors
+```
+[server]
+port = 30000
+host = "localhost"
 
-`Toml.parse` returns a `Result`. `!` unwraps it (panicking on a bad document),
-`?` propagates it, and `match` lets you handle it. Errors carry a message plus
-the line and column:
-
-```milo
-match Toml.parse(text) {
-    Result.Ok(doc) => {
-        print(doc.str("name") ?? "unnamed")
-    }
-    Result.Err(e) => {
-        eprint("bad config: " + e)   // toml: duplicate key 'a' (line 2, column 1)
-        return 1
-    }
-}
+round-trips: true
 ```
 
-## Writing TOML
+Formatting is not preserved, which the output above shows: comments are dropped,
+`30_000` comes back as `30000`, and `'literal'` strings come back
+double-quoted. Key order, values, types and structure are preserved.
 
-`stringify` renders a document back to text that re-parses to an equal document.
-Round-trip it and the second rendering is byte-identical to the first:
-
-```milo
-from "toml" import { Toml }
-from "std/fs" import { readFile }
-
-pub fn main(): i32 {
-    let doc = Toml.parse(readFile("app.toml")!)!
-
-    let text = doc.stringify()
-    let again = Toml.parse(text.clone())!
-
-    print((text == again.stringify()).toString())   // true
-    print((again.i64Path("server.port") ?? 0).toString())
-    return 0
-}
-```
-
-Formatting is not preserved. Comments are dropped, `30_000` comes back as `30000`,
-`'literal'` strings come back double-quoted, and an inline table that owns only tables
-comes back as a `[section]`. Key order, values, types and structure are preserved.
-
-## Runnable examples
-
-`examples/` holds a complete program you can run against a real config:
-
-```bash
-milo run examples/config.milo examples/app.toml
-```
-
-- `examples/config.milo` — typed lookups with defaults, a nested table, and an
-  array of tables walked in order
-- `examples/app.toml` — the service config it reads
-
-`tests/corpus/` has 78 more TOML files covering every construct in the spec, if
-you want to see what a given piece of syntax parses to.
-
-## API
-
-```milo
-Toml.parse(text)          // Result<Toml>
-
-// tables
-doc.get("key")            // Option<Toml>    — any value
-doc.str("key")            // Option<string>
-doc.i64("key")            // Option<i64>     — None for a float
-doc.f64("key")            // Option<f64>     — an integer widens
-doc.bool("key")           // Option<bool>
-doc.table("key")          // Option<Toml>    — sub-table only
-doc.keys()                // Vec<string>     — in document order
-
-// dotted paths
-doc.path("a.b.c")         // Option<Toml>
-doc.strPath("a.b")        doc.i64Path("a.b")
-doc.f64Path("a.b")        doc.boolPath("a.b")
-
-// arrays
-doc.at(0)                 // Option<Toml>
-doc.len()                 // i64             — array elements, or table entries
-
-// the value at this handle
-doc.asStr()               doc.asI64()        doc.asF64()      doc.asBool()
-
-// what is here
-doc.kind()                // TomlKind.Str | Int | Float | Bool | DateTime | Array | Table
-doc.isStr()               doc.isInt()        doc.isFloat()    doc.isNum()
-doc.isBool()              doc.isDateTime()   doc.isArray()    doc.isTable()
-
-// out
-doc.stringify()           // string
-```
-
-## Notes
-
-- **Strict, not last-wins.** Duplicate keys, duplicate table headers, and
-  redefining a table as a non-table are errors with a line and column — not
-  silently accepted.
-- **Datetimes keep their original text.** They are recognised, range-checked,
-  and tagged `TomlKind.DateTime`; read them back with `asStr`. This library
-  builds no temporal values, because a lossy conversion would be worse than the
-  original text.
-- **Conformance.** Graded against Python's `tomllib` over a 78-file corpus
-  (31 valid, 47 invalid), comparing values *and* types, on both a direct parse
-  and a `parse → stringify → parse` round trip. Every TOML v1.0.0 construct is
-  implemented: dotted keys, arrays of tables, inline tables, multi-line basic
-  and literal strings, integer radixes, float specials, and all four datetime
-  forms.
-
-## License
-
-MIT
+A complete program against a real service config:
+`milo run examples/config.milo examples/app.toml`.
