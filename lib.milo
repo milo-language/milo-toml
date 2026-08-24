@@ -52,16 +52,35 @@ let TK_TABLE: i32 = TomlKind.Table as i32
 //   isDotted   — this table was created (or traversed) by a dotted key
 //   isInline   — this table/array came from `{...}`/`[...]`, so it is frozen
 //   isAot      — this array was created by `[[header]]`, so it accepts appends
+// Handles into the two index spaces this parser keeps. Both compile to exactly an i64
+// (a single-field struct is a zero-cost newtype), but the checker will not let one stand
+// in for the other — `n.firstChild = internStr(...)` was previously silent and produced a
+// node link pointing into the string pool. Mirrors yaml/lib.milo, which draws the same
+// line, and leaves genuine offsets and counts as plain i64.
+pub struct NodeId {
+    idx: i64,
+}
+
+pub struct StrId {
+    idx: i64,
+}
+
+// `-1` stays the "missing" sentinel it was as a bare i64, so chained lookups still work.
+fn nilNode(): NodeId { return NodeId { idx: -1 } }
+fn isNilNode(h: NodeId): bool { return h.idx < 0 }
+fn nilStr(): StrId { return StrId { idx: -1 } }
+fn isNilStr(h: StrId): bool { return h.idx < 0 }
+
 pub struct TomlNode {
     kind: i32,
     boolVal: bool,
     intVal: i64,
     numVal: f64,
-    strIdx: i64,
-    keyIdx: i64,
-    firstChild: i64,
-    lastChild: i64,
-    nextSibling: i64,
+    strIdx: StrId,
+    keyIdx: StrId,
+    firstChild: NodeId,
+    lastChild: NodeId,
+    nextSibling: NodeId,
     childCount: i64,
     isExplicit: bool,
     isDotted: bool,
@@ -74,7 +93,7 @@ pub struct Toml {
     nodes: Vec<TomlNode>,
     strs: Vec<string>,
     keyStrs: Vec<string>,
-    root: i64,
+    root: NodeId,
 }
 
 // ── Parser state ──
@@ -230,50 +249,50 @@ impl TomlP {
 
     // ── Node pool ──
 
-    fn newNode(self: &mut Self, kind: i32): i64 {
+    fn newNode(self: &mut Self, kind: i32): NodeId {
         let idx = self.nodes.len()
         self.nodes.push(TomlNode {
-            kind: kind, boolVal: false, intVal: 0, numVal: 0.0, strIdx: -1, keyIdx: -1,
-            firstChild: -1, lastChild: -1, nextSibling: -1, childCount: 0,
+            kind: kind, boolVal: false, intVal: 0, numVal: 0.0, strIdx: nilStr(), keyIdx: nilStr(),
+            firstChild: nilNode(), lastChild: nilNode(), nextSibling: nilNode(), childCount: 0,
             isExplicit: false, isDotted: false, isInline: false, isAot: false,
         }
         )
-        return idx
+        return NodeId { idx: idx }
     }
 
-    fn internStr(self: &mut Self, s: string): i64 {
+    fn internStr(self: &mut Self, s: string): StrId {
         let i = self.strs.len()
         self.strs.push(s)
-        return i
+        return StrId { idx: i }
     }
 
-    fn setKey(self: &mut Self, node: i64, key: string) {
+    fn setKey(self: &mut Self, node: NodeId, key: string) {
         let i = self.keyStrs.len()
         self.keyStrs.push(key)
-        self.nodes[node].keyIdx = i
+        self.nodes[node.idx].keyIdx = StrId { idx: i }
     }
 
-    fn appendChild(self: &mut Self, parent: i64, child: i64) {
-        let last = self.nodes[parent].lastChild
-        if last < 0 {
-            self.nodes[parent].firstChild = child
+    fn appendChild(self: &mut Self, parent: NodeId, child: NodeId) {
+        let last = self.nodes[parent.idx].lastChild
+        if last.idx < 0 {
+            self.nodes[parent.idx].firstChild = child
         } else {
-            self.nodes[last].nextSibling = child
+            self.nodes[last.idx].nextSibling = child
         }
-        self.nodes[parent].lastChild = child
-        self.nodes[parent].childCount = self.nodes[parent].childCount + 1
+        self.nodes[parent.idx].lastChild = child
+        self.nodes[parent.idx].childCount = self.nodes[parent.idx].childCount + 1
     }
 
-    fn findChild(self: &Self, parent: i64, key: &string): i64 {
-        var c = self.nodes[parent].firstChild
-        while c >= 0 {
-            let ki = self.nodes[c].keyIdx
-            if ki >= 0 && self.keyStrs[ki] == key {
+    fn findChild(self: &Self, parent: NodeId, key: &string): NodeId {
+        var c = self.nodes[parent.idx].firstChild
+        while c.idx >= 0 {
+            let ki = self.nodes[c.idx].keyIdx
+            if ki.idx >= 0 && self.keyStrs[ki.idx] == key {
                 return c
             }
-            c = self.nodes[c].nextSibling
+            c = self.nodes[c.idx].nextSibling
         }
-        return -1
+        return nilNode()
     }
 
     // ── Whitespace, comments, line structure ──
@@ -706,7 +725,7 @@ impl TomlP {
         }
     }
 
-    fn parseDateTimeValue(self: &mut Self): i64 {
+    fn parseDateTimeValue(self: &mut Self): NodeId {
         let start = self.pos
         let year = self.readDigits(4)
         self.expectByte('-', "malformed date")
@@ -714,11 +733,11 @@ impl TomlP {
         self.expectByte('-', "malformed date")
         let day = self.readDigits(2)
         if self.failed() {
-            return -1
+            return nilNode()
         }
         if month < 1 || month > 12 || day < 1 || day > tomlDaysInMonth(year, month) {
             self.fail("date out of range", start)
-            return -1
+            return nilNode()
         }
         let sep = self.peek()
         var hasTime: bool = false
@@ -732,7 +751,7 @@ impl TomlP {
         if hasTime {
             self.parseTimeBody()
             if self.failed() {
-                return -1
+                return nilNode()
             }
             let off = self.peek()
             if off == 'Z' || off == 'z' {
@@ -743,29 +762,29 @@ impl TomlP {
                 self.expectByte(':', "malformed time offset")
                 let om = self.readDigits(2)
                 if self.failed() {
-                    return -1
+                    return nilNode()
                 }
                 if oh > 23 || om > 59 {
                     self.fail("time offset out of range", self.pos)
-                    return -1
+                    return nilNode()
                 }
             }
         }
         let idx = self.newNode(TK_DATETIME)
         let text = self.src[start..self.pos].clone()
-        self.nodes[idx].strIdx = self.internStr(text)
+        self.nodes[idx.idx].strIdx = self.internStr(text)
         return idx
     }
 
-    fn parseLocalTimeValue(self: &mut Self): i64 {
+    fn parseLocalTimeValue(self: &mut Self): NodeId {
         let start = self.pos
         self.parseTimeBody()
         if self.failed() {
-            return -1
+            return nilNode()
         }
         let idx = self.newNode(TK_DATETIME)
         let text = self.src[start..self.pos].clone()
-        self.nodes[idx].strIdx = self.internStr(text)
+        self.nodes[idx.idx].strIdx = self.internStr(text)
         return idx
     }
 
@@ -805,7 +824,7 @@ impl TomlP {
         return acc
     }
 
-    fn parseNumberValue(self: &mut Self): i64 {
+    fn parseNumberValue(self: &mut Self): NodeId {
         let start = self.pos
         var neg: bool = false
         var signed: bool = false
@@ -820,22 +839,22 @@ impl TomlP {
         if self.matchLit("inf") {
             let idx = self.newNode(TK_FLOAT)
             if neg {
-                self.nodes[idx].numVal = 0.0 - f64.INF
+                self.nodes[idx.idx].numVal = 0.0 - f64.INF
             } else {
-                self.nodes[idx].numVal = f64.INF
+                self.nodes[idx.idx].numVal = f64.INF
             }
             return idx
         }
         if self.matchLit("nan") {
             let idx = self.newNode(TK_FLOAT)
-            self.nodes[idx].numVal = f64.NAN
+            self.nodes[idx.idx].numVal = f64.NAN
             return idx
         }
         // Radix-prefixed integers take no sign, per the spec.
         if self.peek() == '0' && (self.peekAt(1) == 'x' || self.peekAt(1) == 'o' || self.peekAt(1) == 'b') {
             if signed {
                 self.fail("sign is not allowed on a prefixed integer", start)
-                return -1
+                return nilNode()
             }
             var base: i64 = 16
             if self.peekAt(1) == 'o' {
@@ -846,20 +865,20 @@ impl TomlP {
             self.pos = self.pos + 2
             let mag = self.readRadixDigits(base, 9223372036854775807)
             if self.failed() {
-                return -1
+                return nilNode()
             }
             let idx = self.newNode(TK_INT)
-            self.nodes[idx].intVal = mag as i64
+            self.nodes[idx.idx].intVal = mag as i64
             return idx
         }
         if self.pos >= self.src.len || !tomlIsDigit(self.src[self.pos]) {
             self.fail("expected a value", start)
-            return -1
+            return nilNode()
         }
         // Leading zeros are not decimal integers: `01` is a typo, not eight.
         if self.src[self.pos] == '0' && (tomlIsDigit(self.peekAt(1)) || self.peekAt(1) == '_') {
             self.fail("leading zeros are not allowed", self.pos)
-            return -1
+            return nilNode()
         }
         let intStart = self.pos
         var limit: u64 = 9223372036854775807
@@ -868,7 +887,7 @@ impl TomlP {
         }
         let mag = self.readRadixDigits(10, limit)
         if self.failed() {
-            return -1
+            return nilNode()
         }
         let isFloat = self.pos < self.src.len && (self.src[self.pos] == '.' || self.src[self.pos] == 'e' || self.src[self.pos] == 'E')
         if !isFloat {
@@ -877,12 +896,12 @@ impl TomlP {
                 if mag == 9223372036854775808 {
                     // i64::MIN cannot be negated from its own magnitude under checked
                     // arithmetic, so build it by subtraction instead.
-                    self.nodes[idx].intVal = 0 - 9223372036854775807 - 1
+                    self.nodes[idx.idx].intVal = 0 - 9223372036854775807 - 1
                 } else {
-                    self.nodes[idx].intVal = 0 - (mag as i64)
+                    self.nodes[idx.idx].intVal = 0 - (mag as i64)
                 }
             } else {
-                self.nodes[idx].intVal = mag as i64
+                self.nodes[idx.idx].intVal = mag as i64
             }
             return idx
         }
@@ -893,14 +912,14 @@ impl TomlP {
         var buf: string = ""
         self.copyFloatDigits(buf)
         if self.failed() {
-            return -1
+            return nilNode()
         }
         if self.pos < self.src.len && self.src[self.pos] == '.' {
             buf.push('.')
             self.pos = self.pos + 1
             self.copyFloatDigits(buf)
             if self.failed() {
-                return -1
+                return nilNode()
             }
         }
         if self.pos < self.src.len && (self.src[self.pos] == 'e' || self.src[self.pos] == 'E') {
@@ -912,16 +931,16 @@ impl TomlP {
             }
             self.copyFloatDigits(buf)
             if self.failed() {
-                return -1
+                return nilNode()
             }
         }
         let parsed = buf.parseF64()
         let idx = self.newNode(TK_FLOAT)
         if let Option.Some(v) = parsed {
             if neg {
-                self.nodes[idx].numVal = 0.0 - v
+                self.nodes[idx.idx].numVal = 0.0 - v
             } else {
-                self.nodes[idx].numVal = v
+                self.nodes[idx.idx].numVal = v
             }
         } else {
             self.fail("malformed float", start)
@@ -957,38 +976,38 @@ impl TomlP {
 
     // ── Values ──
 
-    fn parseValue(self: &mut Self): i64 {
+    fn parseValue(self: &mut Self): NodeId {
         if self.depth > TOML_MAX_DEPTH {
             self.fail("nesting too deep", self.pos)
-            return -1
+            return nilNode()
         }
         if self.atEnd() {
             self.fail("expected a value", self.pos)
-            return -1
+            return nilNode()
         }
         let c = self.peek()
         if c == '"' {
             if self.peekAt(1) == '"' && self.peekAt(2) == '"' {
                 let s = self.parseMultilineString(true)
                 let idx = self.newNode(TK_STR)
-                self.nodes[idx].strIdx = self.internStr(s)
+                self.nodes[idx.idx].strIdx = self.internStr(s)
                 return idx
             }
             let s = self.parseBasicString()
             let idx = self.newNode(TK_STR)
-            self.nodes[idx].strIdx = self.internStr(s)
+            self.nodes[idx.idx].strIdx = self.internStr(s)
             return idx
         }
         if c == '\'' {
             if self.peekAt(1) == '\'' && self.peekAt(2) == '\'' {
                 let s = self.parseMultilineString(false)
                 let idx = self.newNode(TK_STR)
-                self.nodes[idx].strIdx = self.internStr(s)
+                self.nodes[idx.idx].strIdx = self.internStr(s)
                 return idx
             }
             let s = self.parseLiteralString()
             let idx = self.newNode(TK_STR)
-            self.nodes[idx].strIdx = self.internStr(s)
+            self.nodes[idx.idx].strIdx = self.internStr(s)
             return idx
         }
         if c == '[' {
@@ -1000,19 +1019,19 @@ impl TomlP {
         if c == 't' {
             if !self.matchLit("true") {
                 self.fail("expected a value", self.pos)
-                return -1
+                return nilNode()
             }
             let idx = self.newNode(TK_BOOL)
-            self.nodes[idx].boolVal = true
+            self.nodes[idx.idx].boolVal = true
             return idx
         }
         if c == 'f' {
             if !self.matchLit("false") {
                 self.fail("expected a value", self.pos)
-                return -1
+                return nilNode()
             }
             let idx = self.newNode(TK_BOOL)
-            self.nodes[idx].boolVal = false
+            self.nodes[idx.idx].boolVal = false
             return idx
         }
         if self.looksLikeDate() {
@@ -1025,14 +1044,14 @@ impl TomlP {
             return self.parseNumberValue()
         }
         self.fail("expected a value", self.pos)
-        return -1
+        return nilNode()
     }
 
-    fn parseArrayValue(self: &mut Self): i64 {
+    fn parseArrayValue(self: &mut Self): NodeId {
         self.pos = self.pos + 1
         self.depth = self.depth + 1
         let arr = self.newNode(TK_ARRAY)
-        self.nodes[arr].isInline = true
+        self.nodes[arr.idx].isInline = true
         while true {
             self.skipWsAndNewlines()
             if self.failed() {
@@ -1073,12 +1092,12 @@ impl TomlP {
     // TOML 1.0 inline tables are single-line and take no trailing comma. Both
     // restrictions are load-bearing: a parser that quietly allows them accepts
     // documents other TOML implementations reject.
-    fn parseInlineTableValue(self: &mut Self): i64 {
+    fn parseInlineTableValue(self: &mut Self): NodeId {
         self.pos = self.pos + 1
         self.depth = self.depth + 1
         let tbl = self.newNode(TK_TABLE)
-        self.nodes[tbl].isInline = true
-        self.nodes[tbl].isExplicit = true
+        self.nodes[tbl.idx].isInline = true
+        self.nodes[tbl.idx].isExplicit = true
         self.skipSpaces()
         if self.peek() == '}' {
             self.pos = self.pos + 1
@@ -1124,36 +1143,36 @@ impl TomlP {
 
     // Walk one segment of a dotted key. Creating tables here is allowed; walking
     // into a `[header]` table, an inline table or a non-table is not.
-    fn dottedDescend(self: &mut Self, parent: i64, key: &string, errPos: i64): i64 {
+    fn dottedDescend(self: &mut Self, parent: NodeId, key: &string, errPos: i64): NodeId {
         let existing = self.findChild(parent, key)
-        if existing < 0 {
+        if existing.idx < 0 {
             let n = self.newNode(TK_TABLE)
-            self.nodes[n].isDotted = true
+            self.nodes[n.idx].isDotted = true
             self.setKey(n, key.clone())
             self.appendChild(parent, n)
             return n
         }
-        if self.nodes[existing].kind != TK_TABLE {
+        if self.nodes[existing.idx].kind != TK_TABLE {
             self.fail("cannot redefine '" + key.clone() + "' as a table", errPos)
-            return -1
+            return nilNode()
         }
-        if self.nodes[existing].isInline {
+        if self.nodes[existing.idx].isInline {
             self.fail("cannot extend inline table '" + key.clone() + "'", errPos)
-            return -1
+            return nilNode()
         }
-        if self.nodes[existing].isExplicit {
+        if self.nodes[existing.idx].isExplicit {
             self.fail("cannot redefine table '" + key.clone() + "' with a dotted key", errPos)
-            return -1
+            return nilNode()
         }
         // Traversing an implicit table with a dotted key claims it, so a later
         // `[header]` naming it is a redefinition.
-        self.nodes[existing].isDotted = true
+        self.nodes[existing.idx].isDotted = true
         return existing
     }
 
     // `key = value` into `table`. `inlineCtx` marks values that came from a `{...}`
     // so their sub-tables stay frozen.
-    fn assignKeyValue(self: &mut Self, table: i64, inlineCtx: bool) {
+    fn assignKeyValue(self: &mut Self, table: NodeId, inlineCtx: bool) {
         let keyPos = self.pos
         let segs = self.parseKeyPath()
         if self.failed() {
@@ -1174,13 +1193,13 @@ impl TomlP {
         var i: i64 = 0
         while i < segs.len() - 1 {
             parent = self.dottedDescend(parent, segs[i], keyPos)
-            if parent < 0 {
+            if isNilNode(parent) {
                 return
             }
             i = i + 1
         }
         let last = segs[segs.len() - 1].clone()
-        if self.findChild(parent, last) >= 0 {
+        if !isNilNode(self.findChild(parent, last)) {
             self.fail("duplicate key '" + last.clone() + "'", keyPos)
             return
         }
@@ -1190,146 +1209,146 @@ impl TomlP {
         }
         // An inline table or array is a closed value: nothing may be added to it
         // later, whether by `[header]` or by a dotted key.
-        if self.nodes[v].kind == TK_TABLE || self.nodes[v].kind == TK_ARRAY {
-            self.nodes[v].isInline = true
+        if self.nodes[v.idx].kind == TK_TABLE || self.nodes[v.idx].kind == TK_ARRAY {
+            self.nodes[v.idx].isInline = true
         }
         if inlineCtx {
-            self.nodes[v].isInline = true
+            self.nodes[v.idx].isInline = true
         }
         self.setKey(v, last)
         self.appendChild(parent, v)
     }
 
     // Walk one intermediate segment of a `[a.b.c]` header.
-    fn headerDescend(self: &mut Self, parent: i64, key: &string, errPos: i64): i64 {
+    fn headerDescend(self: &mut Self, parent: NodeId, key: &string, errPos: i64): NodeId {
         let existing = self.findChild(parent, key)
-        if existing < 0 {
+        if existing.idx < 0 {
             let n = self.newNode(TK_TABLE)
             self.setKey(n, key.clone())
             self.appendChild(parent, n)
             return n
         }
-        if self.nodes[existing].kind == TK_ARRAY {
-            if self.nodes[existing].isAot && self.nodes[existing].lastChild >= 0 {
-                return self.nodes[existing].lastChild
+        if self.nodes[existing.idx].kind == TK_ARRAY {
+            if self.nodes[existing.idx].isAot && self.nodes[existing.idx].lastChild.idx >= 0 {
+                return self.nodes[existing.idx].lastChild
             }
             self.fail("cannot extend array '" + key.clone() + "' with a table header", errPos)
-            return -1
+            return nilNode()
         }
-        if self.nodes[existing].kind != TK_TABLE {
+        if self.nodes[existing.idx].kind != TK_TABLE {
             self.fail("cannot redefine '" + key.clone() + "' as a table", errPos)
-            return -1
+            return nilNode()
         }
-        if self.nodes[existing].isInline {
+        if self.nodes[existing.idx].isInline {
             self.fail("cannot extend inline table '" + key.clone() + "'", errPos)
-            return -1
+            return nilNode()
         }
         return existing
     }
 
     // `[a.b]` — returns the table that following key/values belong to.
-    fn parseTableHeader(self: &mut Self): i64 {
+    fn parseTableHeader(self: &mut Self): NodeId {
         let hdrPos = self.pos
         self.pos = self.pos + 1
         self.skipSpaces()
         let segs = self.parseKeyPath()
         if self.failed() {
-            return 0
+            return NodeId { idx: 0 }
         }
         if segs.len() == 0 {
             self.fail("expected a table name", hdrPos)
-            return 0
+            return NodeId { idx: 0 }
         }
         self.skipSpaces()
         if self.peek() != ']' {
             self.fail("expected ']' after table name", self.pos)
-            return 0
+            return NodeId { idx: 0 }
         }
         self.pos = self.pos + 1
-        var parent: i64 = 0
+        var parent: NodeId = NodeId { idx: 0 }
         var i: i64 = 0
         while i < segs.len() - 1 {
             parent = self.headerDescend(parent, segs[i], hdrPos)
-            if parent < 0 {
-                return 0
+            if parent.idx < 0 {
+                return NodeId { idx: 0 }
             }
             i = i + 1
         }
         let last = segs[segs.len() - 1].clone()
         let existing = self.findChild(parent, last)
-        if existing < 0 {
+        if existing.idx < 0 {
             let n = self.newNode(TK_TABLE)
-            self.nodes[n].isExplicit = true
+            self.nodes[n.idx].isExplicit = true
             self.setKey(n, last)
             self.appendChild(parent, n)
             return n
         }
-        if self.nodes[existing].kind != TK_TABLE {
+        if self.nodes[existing.idx].kind != TK_TABLE {
             self.fail("cannot redefine '" + last.clone() + "' as a table", hdrPos)
-            return 0
+            return NodeId { idx: 0 }
         }
-        if self.nodes[existing].isExplicit || self.nodes[existing].isDotted || self.nodes[existing].isInline {
+        if self.nodes[existing.idx].isExplicit || self.nodes[existing.idx].isDotted || self.nodes[existing.idx].isInline {
             self.fail("table '" + last.clone() + "' is defined twice", hdrPos)
-            return 0
+            return NodeId { idx: 0 }
         }
-        self.nodes[existing].isExplicit = true
+        self.nodes[existing.idx].isExplicit = true
         return existing
     }
 
     // `[[a.b]]` — appends a fresh element and returns it.
-    fn parseArrayTableHeader(self: &mut Self): i64 {
+    fn parseArrayTableHeader(self: &mut Self): NodeId {
         let hdrPos = self.pos
         self.pos = self.pos + 2
         self.skipSpaces()
         let segs = self.parseKeyPath()
         if self.failed() {
-            return 0
+            return NodeId { idx: 0 }
         }
         if segs.len() == 0 {
             self.fail("expected a table name", hdrPos)
-            return 0
+            return NodeId { idx: 0 }
         }
         self.skipSpaces()
         if self.peek() != ']' || self.peekAt(1) != ']' {
             self.fail("expected ']]' after array-of-tables name", self.pos)
-            return 0
+            return NodeId { idx: 0 }
         }
         self.pos = self.pos + 2
-        var parent: i64 = 0
+        var parent: NodeId = NodeId { idx: 0 }
         var i: i64 = 0
         while i < segs.len() - 1 {
             parent = self.headerDescend(parent, segs[i], hdrPos)
-            if parent < 0 {
-                return 0
+            if parent.idx < 0 {
+                return NodeId { idx: 0 }
             }
             i = i + 1
         }
         let last = segs[segs.len() - 1].clone()
         let existing = self.findChild(parent, last)
-        if existing < 0 {
+        if existing.idx < 0 {
             let arr = self.newNode(TK_ARRAY)
-            self.nodes[arr].isAot = true
+            self.nodes[arr.idx].isAot = true
             self.setKey(arr, last)
             self.appendChild(parent, arr)
             let elem = self.newNode(TK_TABLE)
-            self.nodes[elem].isExplicit = true
+            self.nodes[elem.idx].isExplicit = true
             self.appendChild(arr, elem)
             return elem
         }
-        if self.nodes[existing].kind != TK_ARRAY || !self.nodes[existing].isAot {
+        if self.nodes[existing.idx].kind != TK_ARRAY || !self.nodes[existing.idx].isAot {
             self.fail("cannot redefine '" + last.clone() + "' as an array of tables", hdrPos)
-            return 0
+            return NodeId { idx: 0 }
         }
         let elem = self.newNode(TK_TABLE)
-        self.nodes[elem].isExplicit = true
+        self.nodes[elem.idx].isExplicit = true
         self.appendChild(existing, elem)
         return elem
     }
 
     fn parseDocument(self: &mut Self) {
         let root = self.newNode(TK_TABLE)
-        self.nodes[root].isExplicit = true
-        var cur: i64 = root
+        self.nodes[root.idx].isExplicit = true
+        var cur: NodeId = root
         self.skipWsAndNewlines()
         while !self.atEnd() && !self.failed() {
             if self.peek() == '[' {
@@ -1379,48 +1398,48 @@ fn tomlParse(s: string): Result<Toml> {
         return Result.Err("toml: " + p.errMsg + tomlPosSuffix(p.src, p.errPos))
     }
     return Result.Ok(Toml {
-        nodes: p.nodes, strs: p.strs, keyStrs: p.keyStrs, root: 0
+        nodes: p.nodes, strs: p.strs, keyStrs: p.keyStrs, root: NodeId { idx: 0 }
     }
     )
 }
 
 // ── Handle plumbing ──
 
-fn tomlChildIndex(doc: &Toml, parent: i64, index: i64): i64 {
-    if parent < 0 || index < 0 {
-        return -1
+fn tomlChildIndex(doc: &Toml, parent: NodeId, index: i64): NodeId {
+    if parent.idx < 0 || index < 0 {
+        return nilNode()
     }
-    var c = doc.nodes[parent].firstChild
+    var c = doc.nodes[parent.idx].firstChild
     var i: i64 = 0
-    while c >= 0 {
+    while c.idx >= 0 {
         if i == index {
             return c
         }
-        c = doc.nodes[c].nextSibling
+        c = doc.nodes[c.idx].nextSibling
         i = i + 1
     }
-    return -1
+    return nilNode()
 }
 
-fn tomlFieldIndex(doc: &Toml, parent: i64, key: &string): i64 {
-    if parent < 0 || doc.nodes[parent].kind != TK_TABLE {
-        return -1
+fn tomlFieldIndex(doc: &Toml, parent: NodeId, key: &string): NodeId {
+    if parent.idx < 0 || doc.nodes[parent.idx].kind != TK_TABLE {
+        return nilNode()
     }
-    var c = doc.nodes[parent].firstChild
-    while c >= 0 {
-        let ki = doc.nodes[c].keyIdx
-        if ki >= 0 && doc.keyStrs[ki] == key {
+    var c = doc.nodes[parent.idx].firstChild
+    while c.idx >= 0 {
+        let ki = doc.nodes[c.idx].keyIdx
+        if ki.idx >= 0 && doc.keyStrs[ki.idx] == key {
             return c
         }
-        c = doc.nodes[c].nextSibling
+        c = doc.nodes[c.idx].nextSibling
     }
-    return -1
+    return nilNode()
 }
 
 // `get`/`at`/`table`/`path` hand back an owned document rooted at one node, which
 // means copying the pool — the same trade std/json makes with jsonExtractSubtree.
 // Use the cursor API below to walk a large document without paying it.
-fn tomlSubdoc(src: &Toml, idx: i64): Toml {
+fn tomlSubdoc(src: &Toml, idx: NodeId): Toml {
     var nodes: Vec<TomlNode> = Vec.new()
     var i: i64 = 0
     while i < src.nodes.len() {
@@ -1466,7 +1485,7 @@ impl Toml {
     // not a table.
     fn get(self: &Self, key: &string): Option<Toml> {
         let idx = tomlFieldIndex(self, self.root, key)
-        if idx < 0 {
+        if idx.idx < 0 {
             return Option.None
         }
         return Option.Some(tomlSubdoc(self, idx))
@@ -1497,7 +1516,7 @@ impl Toml {
     // The sub-table at `key` — TOML's spelling of std/json's object accessor.
     fn table(self: &Self, key: &string): Option<Toml> {
         let idx = tomlFieldIndex(self, self.root, key)
-        if idx < 0 || self.nodes[idx].kind != TK_TABLE {
+        if idx.idx < 0 || self.nodes[idx.idx].kind != TK_TABLE {
             return Option.None
         }
         return Option.Some(tomlSubdoc(self, idx))
@@ -1506,16 +1525,16 @@ impl Toml {
     // Every key of this table, in document order. Empty for a non-table.
     fn keys(self: &Self): Vec<string> {
         var out: Vec<string> = Vec.new()
-        if self.nodes[self.root].kind != TK_TABLE {
+        if self.nodes[self.root.idx].kind != TK_TABLE {
             return out
         }
-        var c = self.nodes[self.root].firstChild
-        while c >= 0 {
-            let ki = self.nodes[c].keyIdx
-            if ki >= 0 {
-                out.push(self.keyStrs[ki].clone())
+        var c = self.nodes[self.root.idx].firstChild
+        while c.idx >= 0 {
+            let ki = self.nodes[c.idx].keyIdx
+            if ki.idx >= 0 {
+                out.push(self.keyStrs[ki.idx].clone())
             }
-            c = self.nodes[c].nextSibling
+            c = self.nodes[c.idx].nextSibling
         }
         return out
     }
@@ -1525,11 +1544,11 @@ impl Toml {
     // The `index`-th element of this array. None for a table — a table's entries
     // are reached by key, or by cursor when the order matters.
     fn at(self: &Self, index: i64): Option<Toml> {
-        if self.nodes[self.root].kind != TK_ARRAY {
+        if self.nodes[self.root.idx].kind != TK_ARRAY {
             return Option.None
         }
         let idx = tomlChildIndex(self, self.root, index)
-        if idx < 0 {
+        if idx.idx < 0 {
             return Option.None
         }
         return Option.Some(tomlSubdoc(self, idx))
@@ -1537,7 +1556,7 @@ impl Toml {
 
     // Element count of an array, or entry count of a table; 0 for a scalar.
     fn len(self: &Self): i64 {
-        return self.nodes[self.root].childCount
+        return self.nodes[self.root.idx].childCount
     }
 
     // ── Bare value extraction ──
@@ -1567,49 +1586,49 @@ impl Toml {
     // What this node holds. The one accessor that tells `Str` from `DateTime`,
     // which both read back through `asStr`.
     fn kind(self: &Self): TomlKind {
-        return TomlKind.tryFrom(self.nodes[self.root].kind)!
+        return TomlKind.tryFrom(self.nodes[self.root.idx].kind)!
     }
 
     // True only for a string; a datetime answers `isDateTime`.
     fn isStr(self: &Self): bool {
-        return self.nodes[self.root].kind == TK_STR
+        return self.nodes[self.root.idx].kind == TK_STR
     }
 
     // True for both integers and floats — `isInt`/`isFloat` separate them.
     fn isNum(self: &Self): bool {
-        return self.nodes[self.root].kind == TK_INT || self.nodes[self.root].kind == TK_FLOAT
+        return self.nodes[self.root.idx].kind == TK_INT || self.nodes[self.root.idx].kind == TK_FLOAT
     }
 
     // True for an integer only — `1.0` is a float in TOML, not an int.
     fn isInt(self: &Self): bool {
-        return self.nodes[self.root].kind == TK_INT
+        return self.nodes[self.root.idx].kind == TK_INT
     }
 
     // True for a float only.
     fn isFloat(self: &Self): bool {
-        return self.nodes[self.root].kind == TK_FLOAT
+        return self.nodes[self.root.idx].kind == TK_FLOAT
     }
 
     // True for a boolean.
     fn isBool(self: &Self): bool {
-        return self.nodes[self.root].kind == TK_BOOL
+        return self.nodes[self.root.idx].kind == TK_BOOL
     }
 
     // An offset date-time, local date-time, local date or local time. Its lexical
     // text is read with `asStr`.
     fn isDateTime(self: &Self): bool {
-        return self.nodes[self.root].kind == TK_DATETIME
+        return self.nodes[self.root.idx].kind == TK_DATETIME
     }
 
     // True for an array, whether written inline or as `[[table]]` elements.
     fn isArray(self: &Self): bool {
-        return self.nodes[self.root].kind == TK_ARRAY
+        return self.nodes[self.root.idx].kind == TK_ARRAY
     }
 
     // True for a table, whether written inline, as a `[header]`, or implied by a
     // dotted key.
     fn isTable(self: &Self): bool {
-        return self.nodes[self.root].kind == TK_TABLE
+        return self.nodes[self.root.idx].kind == TK_TABLE
     }
 
     // ── Zero-copy cursor navigation ──
@@ -1624,106 +1643,106 @@ impl Toml {
     // Unlike std/json's, `curChild` indexes tables as well as arrays, and
     // `curKey` names the child it lands on — that is what makes a generic walk
     // over a TOML document possible without cloning at every level.
-    fn curRoot(self: &Self): i64 {
+    fn curRoot(self: &Self): NodeId {
         return self.root
     }
 
     // The `index`-th child of the array or table at `cur`; -1 if there is none.
-    fn curChild(self: &Self, cur: i64, index: i64): i64 {
-        if cur < 0 {
-            return -1
+    fn curChild(self: &Self, cur: NodeId, index: i64): NodeId {
+        if cur.idx < 0 {
+            return nilNode()
         }
-        let k = self.nodes[cur].kind
+        let k = self.nodes[cur.idx].kind
         if k != TK_ARRAY && k != TK_TABLE {
-            return -1
+            return nilNode()
         }
         return tomlChildIndex(self, cur, index)
     }
 
     // The key of the `index`-th entry of the table at `cur`.
-    fn curKey(self: &Self, cur: i64, index: i64): Option<string> {
-        if cur < 0 || self.nodes[cur].kind != TK_TABLE {
+    fn curKey(self: &Self, cur: NodeId, index: i64): Option<string> {
+        if cur.idx < 0 || self.nodes[cur.idx].kind != TK_TABLE {
             return Option.None
         }
         let c = tomlChildIndex(self, cur, index)
-        if c < 0 {
+        if c.idx < 0 {
             return Option.None
         }
-        let ki = self.nodes[c].keyIdx
-        if ki < 0 {
+        let ki = self.nodes[c.idx].keyIdx
+        if ki.idx < 0 {
             return Option.None
         }
-        return Option.Some(self.keyStrs[ki].clone())
+        return Option.Some(self.keyStrs[ki.idx].clone())
     }
 
     // The value at `key` in the table at `cur`; -1 if absent or not a table.
-    fn curField(self: &Self, cur: i64, key: &string): i64 {
+    fn curField(self: &Self, cur: NodeId, key: &string): NodeId {
         return tomlFieldIndex(self, cur, key)
     }
 
     // Child count at the cursor: array elements or table entries; 0 for a scalar.
-    fn curLen(self: &Self, cur: i64): i64 {
-        if cur < 0 {
+    fn curLen(self: &Self, cur: NodeId): i64 {
+        if cur.idx < 0 {
             return 0
         }
-        return self.nodes[cur].childCount
+        return self.nodes[cur.idx].childCount
     }
 
     // The kind at the cursor, or None if the cursor is invalid.
-    fn curKind(self: &Self, cur: i64): Option<TomlKind> {
-        if cur < 0 {
+    fn curKind(self: &Self, cur: NodeId): Option<TomlKind> {
+        if cur.idx < 0 {
             return Option.None
         }
-        return TomlKind.tryFrom(self.nodes[cur].kind)
+        return TomlKind.tryFrom(self.nodes[cur.idx].kind)
     }
 
     // The string at the cursor, materialized. A datetime answers with its lexical
     // text — the one place a cursor read allocates.
-    fn curStr(self: &Self, cur: i64): Option<string> {
-        if cur < 0 {
+    fn curStr(self: &Self, cur: NodeId): Option<string> {
+        if cur.idx < 0 {
             return Option.None
         }
-        let n = self.nodes[cur]
-        if (n.kind == TK_STR || n.kind == TK_DATETIME) && n.strIdx >= 0 {
-            return Option.Some(self.strs[n.strIdx].clone())
+        let n = self.nodes[cur.idx]
+        if (n.kind == TK_STR || n.kind == TK_DATETIME) && n.strIdx.idx >= 0 {
+            return Option.Some(self.strs[n.strIdx.idx].clone())
         }
         return Option.None
     }
 
     // The integer at the cursor; None for a float.
-    fn curInt(self: &Self, cur: i64): Option<i64> {
-        if cur < 0 {
+    fn curInt(self: &Self, cur: NodeId): Option<i64> {
+        if cur.idx < 0 {
             return Option.None
         }
-        if self.nodes[cur].kind != TK_INT {
+        if self.nodes[cur.idx].kind != TK_INT {
             return Option.None
         }
-        return Option.Some(self.nodes[cur].intVal)
+        return Option.Some(self.nodes[cur.idx].intVal)
     }
 
     // The float at the cursor; an integer widens.
-    fn curFloat(self: &Self, cur: i64): Option<f64> {
-        if cur < 0 {
+    fn curFloat(self: &Self, cur: NodeId): Option<f64> {
+        if cur.idx < 0 {
             return Option.None
         }
-        if self.nodes[cur].kind == TK_FLOAT {
-            return Option.Some(self.nodes[cur].numVal)
+        if self.nodes[cur.idx].kind == TK_FLOAT {
+            return Option.Some(self.nodes[cur.idx].numVal)
         }
-        if self.nodes[cur].kind == TK_INT {
-            return Option.Some(self.nodes[cur].intVal as f64)
+        if self.nodes[cur.idx].kind == TK_INT {
+            return Option.Some(self.nodes[cur.idx].intVal as f64)
         }
         return Option.None
     }
 
     // The boolean at the cursor.
-    fn curBool(self: &Self, cur: i64): Option<bool> {
-        if cur < 0 {
+    fn curBool(self: &Self, cur: NodeId): Option<bool> {
+        if cur.idx < 0 {
             return Option.None
         }
-        if self.nodes[cur].kind != TK_BOOL {
+        if self.nodes[cur.idx].kind != TK_BOOL {
             return Option.None
         }
-        return Option.Some(self.nodes[cur].boolVal)
+        return Option.Some(self.nodes[cur.idx].boolVal)
     }
 
     // ── Path accessors ──
@@ -1736,8 +1755,8 @@ impl Toml {
     // key, an out-of-range index or a shape mismatch yields -1, which every cursor
     // accessor reads as "nothing here", so the walk is total for any input. A key
     // containing '.' or '[' is not addressable this way; use get()/at().
-    fn curPath(self: &Self, p: &string): i64 {
-        var cur: i64 = self.root
+    fn curPath(self: &Self, p: &string): NodeId {
+        var cur: NodeId = self.root
         var seg: string = ""
         var inIndex: bool = false
         var idx: i64 = 0
@@ -1750,7 +1769,7 @@ impl Toml {
                 } else if b >= '0' && b <= '9' {
                     idx = idx * 10 + ((b as i64) - 48)
                 } else {
-                    return -1
+                    return nilNode()
                 }
             } else if b == '.' {
                 if seg.len > 0 {
@@ -1767,13 +1786,13 @@ impl Toml {
             } else {
                 seg.push(b)
             }
-            if cur < 0 {
-                return -1
+            if cur.idx < 0 {
+                return nilNode()
             }
         }
         // An unterminated '[' never resolved to a child, so the path is malformed.
         if inIndex {
-            return -1
+            return nilNode()
         }
         if seg.len > 0 {
             cur = self.curField(cur, seg)
@@ -1784,7 +1803,7 @@ impl Toml {
     // The value at a dotted path, whatever its kind.
     fn path(self: &Self, p: &string): Option<Toml> {
         let cur = self.curPath(p)
-        if cur < 0 {
+        if cur.idx < 0 {
             return Option.None
         }
         return Option.Some(tomlSubdoc(self, cur))
@@ -1819,7 +1838,7 @@ impl Toml {
     // only tables comes back as a section — but values, types and structure are.
     fn stringify(self: &Self): string {
         var out: string = ""
-        if self.nodes[self.root].kind != TK_TABLE {
+        if self.nodes[self.root.idx].kind != TK_TABLE {
             return tomlInlineValue(self, self.root) + "\n"
         }
         tomlWriteTable(self, self.root, "", out)
@@ -1911,13 +1930,13 @@ fn tomlRenderFloat(v: f64): string {
     return s + ".0"
 }
 
-fn tomlInlineValue(doc: &Toml, idx: i64): string {
-    let n = doc.nodes[idx]
+fn tomlInlineValue(doc: &Toml, idx: NodeId): string {
+    let n = doc.nodes[idx.idx]
     if n.kind == TK_STR {
-        return tomlEscapeStr(doc.strs[n.strIdx])
+        return tomlEscapeStr(doc.strs[n.strIdx.idx])
     }
     if n.kind == TK_DATETIME {
-        return doc.strs[n.strIdx].clone()
+        return doc.strs[n.strIdx.idx].clone()
     }
     if n.kind == TK_INT {
         return n.intVal.toString()
@@ -1935,43 +1954,43 @@ fn tomlInlineValue(doc: &Toml, idx: i64): string {
         var out: string = "["
         var c = n.firstChild
         var first: bool = true
-        while c >= 0 {
+        while c.idx >= 0 {
             if !first {
                 out = out + ", "
             }
             first = false
             out = out + tomlInlineValue(doc, c)
-            c = doc.nodes[c].nextSibling
+            c = doc.nodes[c.idx].nextSibling
         }
         return out + "]"
     }
     var out: string = "{"
     var c = n.firstChild
     var first: bool = true
-    while c >= 0 {
+    while c.idx >= 0 {
         if !first {
             out = out + ", "
         }
         first = false
-        let ki = doc.nodes[c].keyIdx
-        out = out + tomlRenderKey(doc.keyStrs[ki]) + " = " + tomlInlineValue(doc, c)
-        c = doc.nodes[c].nextSibling
+        let ki = doc.nodes[c.idx].keyIdx
+        out = out + tomlRenderKey(doc.keyStrs[ki.idx]) + " = " + tomlInlineValue(doc, c)
+        c = doc.nodes[c.idx].nextSibling
     }
     return out + "}"
 }
 
 // An array is emitted as `[[header]]` blocks only when it is non-empty and holds
 // nothing but tables; anything else round-trips fine as an inline array.
-fn tomlIsTableArray(doc: &Toml, idx: i64): bool {
-    if doc.nodes[idx].kind != TK_ARRAY || doc.nodes[idx].childCount == 0 {
+fn tomlIsTableArray(doc: &Toml, idx: NodeId): bool {
+    if doc.nodes[idx.idx].kind != TK_ARRAY || doc.nodes[idx.idx].childCount == 0 {
         return false
     }
-    var c = doc.nodes[idx].firstChild
-    while c >= 0 {
-        if doc.nodes[c].kind != TK_TABLE {
+    var c = doc.nodes[idx.idx].firstChild
+    while c.idx >= 0 {
+        if doc.nodes[c.idx].kind != TK_TABLE {
             return false
         }
-        c = doc.nodes[c].nextSibling
+        c = doc.nodes[c.idx].nextSibling
     }
     return true
 }
@@ -1983,39 +2002,39 @@ fn tomlJoinPath(prefix: &string, key: &string): string {
     return prefix.clone() + "." + tomlRenderKey(key)
 }
 
-fn tomlWriteTable(doc: &Toml, idx: i64, prefix: &string, out: &mut string) {
-    var c = doc.nodes[idx].firstChild
-    while c >= 0 {
-        let k = doc.nodes[c].kind
+fn tomlWriteTable(doc: &Toml, idx: NodeId, prefix: &string, out: &mut string) {
+    var c = doc.nodes[idx.idx].firstChild
+    while c.idx >= 0 {
+        let k = doc.nodes[c.idx].kind
         if k != TK_TABLE && !tomlIsTableArray(doc, c) {
-            let ki = doc.nodes[c].keyIdx
-            out = out + tomlRenderKey(doc.keyStrs[ki]) + " = " + tomlInlineValue(doc, c) + "\n"
+            let ki = doc.nodes[c.idx].keyIdx
+            out = out + tomlRenderKey(doc.keyStrs[ki.idx]) + " = " + tomlInlineValue(doc, c) + "\n"
         }
-        c = doc.nodes[c].nextSibling
+        c = doc.nodes[c.idx].nextSibling
     }
-    c = doc.nodes[idx].firstChild
-    while c >= 0 {
-        let ki = doc.nodes[c].keyIdx
-        let k = doc.nodes[c].kind
+    c = doc.nodes[idx.idx].firstChild
+    while c.idx >= 0 {
+        let ki = doc.nodes[c.idx].keyIdx
+        let k = doc.nodes[c.idx].kind
         if k == TK_TABLE {
-            let sub = tomlJoinPath(prefix, doc.keyStrs[ki])
+            let sub = tomlJoinPath(prefix, doc.keyStrs[ki.idx])
             if out.len > 0 {
                 out = out + "\n"
             }
             out = out + "[" + sub.clone() + "]\n"
             tomlWriteTable(doc, c, sub, out)
         } else if tomlIsTableArray(doc, c) {
-            let sub = tomlJoinPath(prefix, doc.keyStrs[ki])
-            var e = doc.nodes[c].firstChild
-            while e >= 0 {
+            let sub = tomlJoinPath(prefix, doc.keyStrs[ki.idx])
+            var e = doc.nodes[c.idx].firstChild
+            while e.idx >= 0 {
                 if out.len > 0 {
                     out = out + "\n"
                 }
                 out = out + "[[" + sub.clone() + "]]\n"
                 tomlWriteTable(doc, e, sub, out)
-                e = doc.nodes[e].nextSibling
+                e = doc.nodes[e.idx].nextSibling
             }
         }
-        c = doc.nodes[c].nextSibling
+        c = doc.nodes[c.idx].nextSibling
     }
 }
