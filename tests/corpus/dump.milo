@@ -12,7 +12,8 @@
 // A parse failure prints `!<message>` in place of both fields.
 from "../../lib" import {
     Toml,
-    TomlKind
+    TomlKind,
+    NodeId
 }
 from "std/json" import {
     jsonEscapeStr
@@ -24,7 +25,7 @@ from "std/args" import {
     args
 }
 
-fn dumpNode(t: &Toml, cur: i64): string {
+fn dumpNode(t: &Toml, cur: NodeId): string {
     let k = t.curKind(cur)!
     match k {
         TomlKind.Str => {

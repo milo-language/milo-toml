@@ -144,3 +144,16 @@ double-quoted. Key order, values, types and structure are preserved.
 
 A complete program against a real service config:
 `milo run examples/config.milo examples/app.toml`.
+
+## 0.2.0 — breaking
+
+Node handles and string-pool handles were both bare `i64`, so assigning one where the
+other belonged compiled silently and produced a link into the wrong pool. They are now
+distinct zero-cost newtypes, `NodeId` and `StrId`, and the checker separates the two
+index spaces.
+
+This changes the public cursor API: `curRoot`, `curChild`, `curField` and `curPath`
+return `NodeId`, and every `cur*` accessor takes one. Callers that stored a cursor as
+`i64` import `NodeId` and use that type instead — the values and the layout are
+unchanged (a single-field struct compiles to exactly its field), so only the spelling
+moves.
