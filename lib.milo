@@ -433,7 +433,7 @@ impl TomlP {
                 return out
             }
             if c == '\\' {
-                self.readEscape(out, false)
+                self.readEscape(&mut out, false)
                 if self.failed() {
                     return out
                 }
@@ -516,11 +516,11 @@ impl TomlP {
             return
         }
         if e == 'u' {
-            self.readUnicodeEscape(out, 4, escPos)
+            self.readUnicodeEscape(&mut out, 4, escPos)
             return
         }
         if e == 'U' {
-            self.readUnicodeEscape(out, 8, escPos)
+            self.readUnicodeEscape(&mut out, 8, escPos)
             return
         }
         if multiline && (e == ' ' || e == '\t' || e == '\n' || e == '\r') {
@@ -571,7 +571,7 @@ impl TomlP {
             self.fail("invalid unicode escape", escPos)
             return
         }
-        tomlPushUtf8(out, cp)
+        tomlPushUtf8(&mut out, cp)
     }
 
     // Positioned on the first of the three opening quotes. `basic` selects `"""`
@@ -624,7 +624,7 @@ impl TomlP {
                 return out
             }
             if c == '\\' && basic {
-                self.readEscape(out, true)
+                self.readEscape(&mut out, true)
                 if self.failed() {
                     return out
                 }
@@ -910,14 +910,14 @@ impl TomlP {
         // correctly-rounded parser.
         self.pos = intStart
         var buf: string = ""
-        self.copyFloatDigits(buf)
+        self.copyFloatDigits(&mut buf)
         if self.failed() {
             return nilNode()
         }
         if self.pos < self.src.len && self.src[self.pos] == '.' {
             buf.push('.')
             self.pos = self.pos + 1
-            self.copyFloatDigits(buf)
+            self.copyFloatDigits(&mut buf)
             if self.failed() {
                 return nilNode()
             }
@@ -929,7 +929,7 @@ impl TomlP {
                 buf.push(self.src[self.pos])
                 self.pos = self.pos + 1
             }
-            self.copyFloatDigits(buf)
+            self.copyFloatDigits(&mut buf)
             if self.failed() {
                 return nilNode()
             }
@@ -1841,7 +1841,7 @@ impl Toml {
         if self.nodes[self.root.idx].kind != TK_TABLE {
             return tomlInlineValue(self, self.root) + "\n"
         }
-        tomlWriteTable(self, self.root, "", out)
+        tomlWriteTable(self, self.root, "", &mut out)
         return out
     }
 }
@@ -2022,7 +2022,7 @@ fn tomlWriteTable(doc: &Toml, idx: NodeId, prefix: &string, out: &mut string) {
                 out = out + "\n"
             }
             out = out + "[" + sub.clone() + "]\n"
-            tomlWriteTable(doc, c, sub, out)
+            tomlWriteTable(doc, c, sub, &mut out)
         } else if tomlIsTableArray(doc, c) {
             let sub = tomlJoinPath(prefix, doc.keyStrs[ki.idx])
             var e = doc.nodes[c.idx].firstChild
@@ -2031,7 +2031,7 @@ fn tomlWriteTable(doc: &Toml, idx: NodeId, prefix: &string, out: &mut string) {
                     out = out + "\n"
                 }
                 out = out + "[[" + sub.clone() + "]]\n"
-                tomlWriteTable(doc, e, sub, out)
+                tomlWriteTable(doc, e, sub, &mut out)
                 e = doc.nodes[e.idx].nextSibling
             }
         }
