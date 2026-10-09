@@ -19,7 +19,7 @@ errors here, not last-wins. Full API: [docs/api.md](docs/api.md).
 ## Installation
 
 ```bash
-milo add github.com/milo-language/milo-toml
+milo pkg add github.com/milo-language/milo-toml
 ```
 
 ```milo
